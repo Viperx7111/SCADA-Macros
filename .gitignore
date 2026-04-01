@@ -1,0 +1,4 @@
+# Excel files with macros (binary - use exported .bas files instead)
+*.xlsm
+*.xlsx
+*.xls
