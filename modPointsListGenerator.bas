@@ -127,6 +127,7 @@ Private Const HDR_DESCRIPTION   As String = "DESCRIPTION"     ' Point descriptio
 Private Const HDR_COMMENTS      As String = "COMMENTS"        ' Always ignored in compare
 Private Const HDR_AESO_REQ      As String = "AESO REQUIRED"   ' Always ignored in compare
 Private Const HDR_AESO_DESC     As String = "AESO DESCRIPTION" ' Always ignored in compare
+Private Const HDR_TEMP_DESC     As String = "TEMP TAG DESCRIPTION" ' Template description with RPL placeholders
 
 ' HEADER ALIASES
 ' The Points List may use different column names than the source tables for
@@ -140,31 +141,12 @@ Private Const HEADER_ALIASES As String = _
 
 ' REPLACEMENT TOKENS
 ' The TEMP TAG DESCRIPTION field can contain literal placeholder text that is
-' replaced with device-specific values at generation time.  Each token must
-' match a column header in the DEVICE_LIST table exactly (case-insensitive);
-' tokens with no matching column are silently skipped.
-'
-' TOKEN NAMING CONVENTION (prefix meanings):
-'   RPL    = "Replace" prefix - all substitutable tokens start with RPL or 86PL
-'   IED    = the IED / device name itself (RPLIED -> IED NAME column)
-'   BKR    = circuit breaker associated with this device (RPLBKR1, RPLBKR2)
-'   BUS    = bus / busbar name (RPLBUS1, RPLBUS2)
-'   TX     = transformer (RPLTX1)
-'   NGR    = neutral grounding resistor (RPLNGR1)
-'   RLY    = relay name (RPLRLY1, RPLRLY2)
-'   86PL   = lockout relay number (86PL1..86PL6) - these are IEC device numbers
-'   PT     = potential / voltage transformer (RPLPT1..3)
-'   CT     = current transformer (RPLCT1..4, RPLGCT1..2  G = ground/neutral side)
-'
-' ORDER MATTERS: tokens are listed longest-first within each prefix family.
-' This prevents partial replacement where a shorter token (e.g. RPLIED) would
-' match the start of a longer one if they shared a prefix.  When adding new
-' tokens, ensure longer tokens precede any token that is a prefix of another.
-Private Const RPL_TOKENS As String = _
-    "RPLIED;RPLBKR1;RPLBKR2;RPLBKR3;RPLFLEX1;RPLBUS1;RPLBUS2;RPLTX1;RPLNGR1;RPLRLY1;RPLRLY2;" & _
-    "86PL1;86PL2;86PL3;86PL4;86PL5;86PL6;" & _
-    "RPLPT1;RPLPT2;RPLPT3;RPLCT1;RPLCT2;RPLCT3;RPLCT4;RPLCT5;RPLCT6;RPLGCT1;RPLGCT2;RPLGCT3" & _
-    "RPLAML1;RPLAML2;RPLAML3"
+' replaced with device-specific values at generation time.  Tokens are
+' discovered dynamically from the DEVICE_LIST table: starting from the RPLIED
+' column, every column to its right is treated as a token whose header is the
+' placeholder text and whose cell value is the substitution.  Tokens are
+' sorted longest-first at load time so shorter tokens cannot partially match
+' inside longer ones during replacement (e.g. RPLIED2 is replaced before RPLIED).
 
 ' TAG NAME SEPARATOR
 ' TAG NAME is a derived field: IED_NAME + separator + TAG_SUFFIX
@@ -180,6 +162,7 @@ Private Const TAG_NAME_SEP As String = "_"
 Private Const CLR_ROW_YELLOW As Long = 65535       ' RGB(255, 255,   0) - row has differences
 Private Const CLR_CELL_RED   As Long = 8421631     ' RGB(255, 128, 128) - specific differing cell
 Private Const CLR_ORPHAN     As Long = 42495        ' RGB(255, 165,   0) - orphaned row (orange)
+Private Const CLR_TOKEN_MISS As Long = 15128749    ' RGB(173, 216, 230) - missing token cell (light blue)
 
 ' COMPARE ENGINE MODES
 Private Const MODE_COMPARE As Long = 1  ' Read-only: highlight + log differences
@@ -2452,6 +2435,337 @@ End Sub
 
 
 ' ============================================================================
+'  PUBLIC: HighlightMissingTokens
+' ============================================================================
+' For each device in DEVICE_LIST, checks which RPL tokens are required by
+' its assigned I/O TEMPLATE, then highlights blank cells in those token
+' columns for that specific device row.
+'
+' ALGORITHM:
+'   1. Clear previous fill highlights from all token columns in DEVICE_LIST
+'      (borders from previous runs are intentionally left in place)
+'   2. Discover token columns: every column from RPLIED rightward
+'   3. Build a per-template token map:
+'        I/O TEMPLATE name -> set of token column indices used in its
+'        TEMP TAG DESCRIPTION rows
+'   4. For each device row, look up its I/O TEMPLATE in the map; for every
+'      token that template requires, highlight the cell if blank
+'   5. Report blank cell count
+'
+' SELF-CONTAINED: reads only DEVICE_LIST and TEMPLATE_TABLE.
+' IDEMPOTENT: fill is cleared on re-run; borders persist until manually cleared.
+' ============================================================================
+Public Sub HighlightMissingTokens()
+
+    Dim currentStep         As String
+    Dim msg                 As String
+    Dim loDevices           As ListObject
+    Dim loTemplates         As ListObject
+    Dim wsDevices           As Worksheet
+    Dim devHeaders()        As String
+    Dim tmpHeaders()        As String
+    Dim devData             As Variant
+    Dim tmpData             As Variant
+    Dim devCols             As Long
+    Dim tmpCols             As Long
+    Dim devRows             As Long
+    Dim tmpRows             As Long
+    Dim dictDevHdr          As Object
+    Dim dictTmpTokens       As Object   ' I/O TEMPLATE name -> inner dict (token text -> devData col)
+    Dim innerDict           As Object
+    Dim rpliedCol           As Long
+    Dim devTmplCol          As Long     ' I/O TEMPLATE column index in devData
+    Dim tmpKeyCol           As Long     ' I/O TEMPLATE column index in tmpData
+    Dim tmpDescCol          As Long     ' TEMP TAG DESCRIPTION column index in tmpData
+    Dim numTokens           As Long
+    Dim tokenText()         As String
+    Dim tokenDevCol()       As Long
+    Dim highlightUnion      As Range    ' blank required cells (fill + border)
+    Dim borderUnion         As Range    ' all required cells (border only)
+    Dim cellRef             As Range
+    Dim cell                As Range
+    Dim dictUnion           As Object   ' address -> True, for adjacency checks
+    Dim bLeft               As Boolean
+    Dim bRight              As Boolean
+    Dim dataStartRow        As Long
+    Dim dataStartCol        As Long
+    Dim blankCount          As Long
+    Dim tmplName            As String
+    Dim tok                 As String
+    Dim desc                As String
+    Dim tokenKeys           As Variant
+    Dim c                   As Long
+    Dim r                   As Long
+    Dim t                   As Long
+
+    On Error GoTo ErrHandler
+    PerformanceOn
+
+    ' ------------------------------------------------------------------
+    ' Resolve table references
+    ' ------------------------------------------------------------------
+    currentStep = "HIGHLIGHT: Resolving table references"
+    Set loDevices   = ThisWorkbook.Worksheets(SH_DEVICES).ListObjects(TBL_DEVICES)
+    Set loTemplates = ThisWorkbook.Worksheets(SH_TEMPLATES).ListObjects(TBL_TEMPLATES)
+    Set wsDevices   = ThisWorkbook.Worksheets(SH_DEVICES)
+
+    ' ------------------------------------------------------------------
+    ' Read headers and data
+    ' ------------------------------------------------------------------
+    currentStep = "HIGHLIGHT: Reading headers"
+    ReadHeaders loDevices,   devHeaders, devCols
+    ReadHeaders loTemplates, tmpHeaders, tmpCols
+
+    currentStep = "HIGHLIGHT: Reading data"
+    ReadData loDevices,   devData, devRows
+    ReadData loTemplates, tmpData, tmpRows
+
+    If devRows = 0 Then
+        MsgBox "DEVICE_LIST has no data rows.", vbExclamation, "Highlight Missing Tokens"
+        GoTo CleanExit
+    End If
+    If tmpRows = 0 Then
+        MsgBox "TEMPLATE_TABLE has no data rows.", vbExclamation, "Highlight Missing Tokens"
+        GoTo CleanExit
+    End If
+
+    ' ------------------------------------------------------------------
+    ' Build header dictionary; locate key columns
+    ' ------------------------------------------------------------------
+    currentStep = "HIGHLIGHT: Locating key columns"
+    Set dictDevHdr = BuildHeaderDict(devHeaders, devCols)
+
+    rpliedCol = 0
+    If dictDevHdr.Exists("RPLIED") Then rpliedCol = CLng(dictDevHdr("RPLIED"))
+    If rpliedCol = 0 Then
+        MsgBox "Device List does not contain an 'RPLIED' column." & vbNewLine & _
+               "Token columns cannot be discovered.", vbCritical, "Highlight Missing Tokens"
+        GoTo CleanExit
+    End If
+
+    devTmplCol = 0
+    If dictDevHdr.Exists(UCase(HDR_IO_TEMPLATE)) Then _
+        devTmplCol = CLng(dictDevHdr(UCase(HDR_IO_TEMPLATE)))
+    If devTmplCol = 0 Then
+        MsgBox "Device List is missing the '" & HDR_IO_TEMPLATE & "' column.", _
+               vbCritical, "Highlight Missing Tokens"
+        GoTo CleanExit
+    End If
+
+    tmpKeyCol  = FindHeader(tmpHeaders, tmpCols, HDR_IO_TEMPLATE)
+    tmpDescCol = FindHeader(tmpHeaders, tmpCols, HDR_TEMP_DESC)
+    If tmpKeyCol = 0 Then
+        MsgBox "TEMPLATE_TABLE is missing the '" & HDR_IO_TEMPLATE & "' column.", _
+               vbCritical, "Highlight Missing Tokens"
+        GoTo CleanExit
+    End If
+    If tmpDescCol = 0 Then
+        MsgBox "TEMPLATE_TABLE is missing the '" & HDR_TEMP_DESC & "' column.", _
+               vbCritical, "Highlight Missing Tokens"
+        GoTo CleanExit
+    End If
+
+    ' ------------------------------------------------------------------
+    ' Discover token columns (RPLIED and every column to its right)
+    ' ------------------------------------------------------------------
+    currentStep = "HIGHLIGHT: Discovering token columns"
+    numTokens = 0
+    ReDim tokenText(0 To devCols - rpliedCol)
+    ReDim tokenDevCol(0 To devCols - rpliedCol)
+
+    For c = rpliedCol To devCols
+        tok = Trim(devHeaders(c))
+        If Len(tok) > 0 Then
+            tokenText(numTokens) = tok
+            tokenDevCol(numTokens) = c
+            numTokens = numTokens + 1
+        End If
+    Next c
+
+    If numTokens = 0 Then
+        MsgBox "No token columns found in Device List (starting from RPLIED).", _
+               vbExclamation, "Highlight Missing Tokens"
+        GoTo CleanExit
+    End If
+
+    ' ------------------------------------------------------------------
+    ' Clear previous fill and borders on token columns
+    ' ------------------------------------------------------------------
+    currentStep = "HIGHLIGHT: Clearing previous highlights"
+    If Not loDevices.DataBodyRange Is Nothing Then
+        Dim clearCol As Range
+        For c = 0 To numTokens - 1
+            Set clearCol = loDevices.DataBodyRange.Columns(tokenDevCol(c))
+            clearCol.Interior.ColorIndex = xlNone
+            clearCol.Borders.LineStyle = xlNone
+        Next c
+    End If
+
+    ' ------------------------------------------------------------------
+    ' Build per-template token map:
+    '   dictTmpTokens(templateName) = inner dict { tokenText -> devData col }
+    ' Scan every TEMPLATE_TABLE row; for each description, record which
+    ' tokens appear under that template's name.
+    ' ------------------------------------------------------------------
+    currentStep = "HIGHLIGHT: Building per-template token map"
+    Application.StatusBar = "Scanning " & tmpRows & " template row(s) for tokens..."
+
+    Set dictTmpTokens = CreateObject("Scripting.Dictionary")
+    dictTmpTokens.CompareMode = vbTextCompare
+
+    For r = 1 To tmpRows
+        tmplName = SafeStr(tmpData, r, tmpKeyCol)
+        If Len(tmplName) = 0 Then GoTo NextTmpRow
+
+        desc = SafeStr(tmpData, r, tmpDescCol)
+        If Len(desc) = 0 Then GoTo NextTmpRow
+
+        ' Ensure inner dict exists for this template
+        If Not dictTmpTokens.Exists(tmplName) Then
+            Set innerDict = CreateObject("Scripting.Dictionary")
+            innerDict.CompareMode = vbTextCompare
+            dictTmpTokens.Add tmplName, innerDict
+        End If
+
+        Set innerDict = dictTmpTokens(tmplName)
+        For t = 0 To numTokens - 1
+            If Not innerDict.Exists(tokenText(t)) Then
+                If InStr(1, desc, tokenText(t), vbTextCompare) > 0 Then
+                    innerDict.Add tokenText(t), tokenDevCol(t)
+                End If
+            End If
+        Next t
+NextTmpRow:
+    Next r
+
+    If dictTmpTokens.Count = 0 Then
+        Application.StatusBar = False
+        MsgBox "No RPL tokens found in any " & HDR_TEMP_DESC & " row." & vbNewLine & _
+               "Nothing to highlight.", vbInformation, "Highlight Missing Tokens"
+        GoTo CleanExit
+    End If
+
+    ' ------------------------------------------------------------------
+    ' For each device row: look up its template, check required token
+    ' cells, highlight blanks
+    ' ------------------------------------------------------------------
+    currentStep = "HIGHLIGHT: Scanning Device List for blank token cells"
+    Application.StatusBar = "Scanning " & devRows & " device row(s) for blank token cells..."
+
+    dataStartRow = loDevices.DataBodyRange.Row
+    dataStartCol = loDevices.DataBodyRange.Column
+    blankCount = 0
+
+    For r = 1 To devRows
+        tmplName = SafeStr(devData, r, devTmplCol)
+        If Len(tmplName) = 0 Then GoTo NextDevRow
+        If Not dictTmpTokens.Exists(tmplName) Then GoTo NextDevRow
+
+        Set innerDict = dictTmpTokens(tmplName)
+        tokenKeys = innerDict.Keys
+        For t = 0 To UBound(tokenKeys)
+            Dim devColIdx As Long
+            devColIdx = CLng(innerDict(CStr(tokenKeys(t))))
+            Set cellRef = wsDevices.Cells(dataStartRow + r - 1, dataStartCol + devColIdx - 1)
+            ' All matching cells get a border
+            If borderUnion Is Nothing Then
+                Set borderUnion = cellRef
+            Else
+                Set borderUnion = Application.Union(borderUnion, cellRef)
+            End If
+            ' Only blank cells get the fill highlight
+            If Len(SafeStr(devData, r, devColIdx)) = 0 Then
+                If highlightUnion Is Nothing Then
+                    Set highlightUnion = cellRef
+                Else
+                    Set highlightUnion = Application.Union(highlightUnion, cellRef)
+                End If
+                blankCount = blankCount + 1
+            End If
+        Next t
+NextDevRow:
+    Next r
+
+    ' ------------------------------------------------------------------
+    ' Apply soft fill to blank required cells.
+    ' Apply medium outer border to ALL required cells (blank or populated).
+    ' Adjacency is evaluated against the full border set so shared edges
+    ' between any two required cells are suppressed.
+    ' ------------------------------------------------------------------
+    If Not borderUnion Is Nothing Then
+        currentStep = "HIGHLIGHT: Applying highlights"
+
+        ' Fill only on blank cells
+        If Not highlightUnion Is Nothing Then
+            highlightUnion.Interior.Color = CLR_TOKEN_MISS
+        End If
+
+        ' Build address lookup over the full border set for adjacency checks
+        Set dictUnion = CreateObject("Scripting.Dictionary")
+        dictUnion.CompareMode = vbTextCompare
+        For Each cell In borderUnion
+            dictUnion(cell.Address) = True
+        Next cell
+
+        ' Top/bottom borders always drawn.
+        ' Left/right borders suppressed only when the horizontal neighbour is
+        ' also in the border set (keeps one clean edge across a row of tokens).
+        For Each cell In borderUnion
+            bLeft  = (cell.Column = 1)             Or Not dictUnion.Exists(cell.Offset(0, -1).Address)
+            bRight = (cell.Column = Columns.Count) Or Not dictUnion.Exists(cell.Offset(0, 1).Address)
+            With cell.Borders
+                .Item(xlEdgeTop).LineStyle    = xlContinuous: .Item(xlEdgeTop).Weight    = xlMedium
+                .Item(xlEdgeBottom).LineStyle = xlContinuous: .Item(xlEdgeBottom).Weight = xlMedium
+                If bLeft  Then .Item(xlEdgeLeft).LineStyle  = xlContinuous: .Item(xlEdgeLeft).Weight  = xlMedium
+                If bRight Then .Item(xlEdgeRight).LineStyle = xlContinuous: .Item(xlEdgeRight).Weight = xlMedium
+            End With
+        Next cell
+    End If
+
+    ' ------------------------------------------------------------------
+    ' Summary
+    ' ------------------------------------------------------------------
+    Application.StatusBar = False
+    If blankCount = 0 Then
+        msg = "Scan complete." & vbNewLine & _
+              "  Templates with tokens: " & dictTmpTokens.Count & vbNewLine & _
+              "  Blank token cells:     none" & vbNewLine & vbNewLine & _
+              "All required token cells are populated."
+        MsgBox msg, vbInformation, "Highlight Missing Tokens"
+    Else
+        msg = "Scan complete." & vbNewLine & _
+              "  Templates with tokens:        " & dictTmpTokens.Count & vbNewLine & _
+              "  Blank token cells highlighted: " & blankCount & vbNewLine & vbNewLine & _
+              "Blank cells highlighted yellow in the Device List."
+        MsgBox msg, vbInformation, "Highlight Missing Tokens"
+    End If
+
+CleanExit:
+    Set dictDevHdr = Nothing
+    Set dictTmpTokens = Nothing
+    Set innerDict = Nothing
+    Set dictUnion = Nothing
+    Set loDevices = Nothing
+    Set loTemplates = Nothing
+    Set wsDevices = Nothing
+    Set highlightUnion = Nothing
+    Set borderUnion = Nothing
+    If IsArray(devHeaders) Then Erase devHeaders
+    If IsArray(tmpHeaders) Then Erase tmpHeaders
+    PerformanceOff
+    Exit Sub
+
+ErrHandler:
+    Application.StatusBar = False
+    Debug.Print "*** ERROR at: " & currentStep & " | " & Err.Number & ": " & Err.Description
+    MsgBox "Error at: " & currentStep & vbNewLine & vbNewLine & _
+           "Error #" & Err.Number & ": " & Err.Description, vbCritical
+    Resume CleanExit
+
+End Sub
+
+
+' ============================================================================
 '  PRIVATE: RunCompareEngine
 ' ============================================================================
 ' Shared engine for ComparePointsList and UpdatePointsList.
@@ -2982,10 +3296,12 @@ Private Function LoadContext() As Object
     Dim ptsCatCol    As Long
     Dim colSource()  As String
     Dim colSourceIdx() As Long
-    Dim tokens()     As String
     Dim tokenText()  As String
     Dim tokenDevCol() As Long
     Dim numTokens    As Long
+    Dim rpliedCol    As Long
+    Dim swapText     As String
+    Dim swapCol      As Long
     Dim dictTemplate As Object
     Dim dictCategory As Object
     Dim hdr          As String
@@ -3102,23 +3418,34 @@ Private Function LoadContext() As Object
     ptsCatCol = FindHeader(ptsHeaders, numPtsCols, HDR_POINT_CAT)
 
     ' --- Build replacement token lookup ---
-    ' Parse RPL_TOKENS and find each token's column in the Device List.
-    ' Tokens whose column doesn't exist in the Device List are silently skipped.
-    tokens = Split(RPL_TOKENS, ";")
+    ' Discover tokens dynamically: find the RPLIED column in the Device List,
+    ' then collect every column from RPLIED rightward as a token.
+    ' Tokens are sorted longest-first so shorter tokens cannot partially match
+    ' inside longer ones during replacement (e.g. RPLIED before RPLIED2).
     numTokens = 0
-    ReDim tokenText(0 To UBound(tokens))
-    ReDim tokenDevCol(0 To UBound(tokens))
-
-    For t = 0 To UBound(tokens)
-        tok = Trim(tokens(t))
-        If Len(tok) > 0 Then
-            If dictDevHdr.Exists(UCase(tok)) Then
+    ReDim tokenText(0 To devCols - 1)
+    ReDim tokenDevCol(0 To devCols - 1)
+    rpliedCol = 0
+    If dictDevHdr.Exists("RPLIED") Then rpliedCol = CLng(dictDevHdr("RPLIED"))
+    If rpliedCol > 0 Then
+        For c = rpliedCol To devCols
+            tok = Trim(devHeaders(c))
+            If Len(tok) > 0 Then
                 tokenText(numTokens) = tok
-                tokenDevCol(numTokens) = CLng(dictDevHdr(UCase(tok)))
+                tokenDevCol(numTokens) = c
                 numTokens = numTokens + 1
             End If
-        End If
-    Next t
+        Next c
+        ' Bubble sort: longest token first
+        For c = 0 To numTokens - 2
+            For t = c + 1 To numTokens - 1
+                If Len(tokenText(t)) > Len(tokenText(c)) Then
+                    swapText = tokenText(c): tokenText(c) = tokenText(t): tokenText(t) = swapText
+                    swapCol = tokenDevCol(c): tokenDevCol(c) = tokenDevCol(t): tokenDevCol(t) = swapCol
+                End If
+            Next t
+        Next c
+    End If
 
     ' --- Build template dictionary: I/O TEMPLATE -> Collection of row indices ---
     Set dictTemplate = CreateObject("Scripting.Dictionary")
